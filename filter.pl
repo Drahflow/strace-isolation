@@ -33,15 +33,26 @@ my $mayRun = 1;
 my $mw = MainWindow->new();
 $mw->withdraw();
 
+my $optimizingCounter = 0;
+
 while(my $line = <STDIN>) {
   chomp $line;
-  warn $line;
+  # warn $line;
   if($line =~ /^CONTINUE/) {
     print $mayRun? "\n": "Nuke it!\n";
   } else {
-    my ($applicableRule) = grep { $line =~ $_ } @validPatterns;
+    my $applicableRule;
+    foreach my $pattern (@validPatterns) {
+      $applicableRule = $pattern and last if $line =~ $pattern;
+    }
+
     if($mayRun = defined $applicableRule) {
-      warn "Auto allowed by " . $applicableRule;
+      # warn "Auto allowed by " . $applicableRule;
+      if(++$optimizingCounter > 500) {
+        warn "Optimizing rule order for " . $applicableRule;
+        @validPatterns = ($applicableRule, grep { $_ != $applicableRule } @validPatterns);
+        $optimizingCounter = 0;
+      }
     } else {
       my $dialog = $mw->DialogBox (-title => "Unexpected syscall requested. What now?",
                                    -buttons => ["Allow", "Create new rule (upper)", "Create new rule (lower)", "Kill"]);
