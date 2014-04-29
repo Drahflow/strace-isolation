@@ -1,4 +1,7 @@
-This is strace, a system call tracer for Linux.
+This is a modified version of strace, a system call tracer for Linux.
+It can launch a filter executable (see filter.pl for an example) to check
+whether a (completed) syscall should have been made. If not, the filter can
+decide to kill the program in question. See at bottom for rationale.
 
 strace is released under a Berkeley-style license at the request
 of Paul Kranenburg; see the file COPYING for details.
@@ -15,3 +18,12 @@ http://sourceforge.net/projects/strace/ .
 
 Please send bug reports and enhancements to the strace
 mailinglist at strace-devel@lists.sourceforge.net.
+
+
+Why on earth would you want to use this? Certainly you can get better
+system isolation with SELinux and/or Xen? Yes. However, the typical
+isolation solution will not present you with a popup dialog if your
+software decides to attempt something "interesting". Also, it is ok
+for your browser to enumerate your home directory, _iff_ you just
+opened the save as dialog pointing to that directory. Again, the
+typical isolation solution will not handle this case.
