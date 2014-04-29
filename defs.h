@@ -409,7 +409,11 @@ struct tcb {
 	int currpers;		/* Personality at the time of scno update */
 #endif
 	int curcol;		/* Output column for this process */
-	FILE *outf;		/* Output file for this process */
+	FILE *inf;              /* Filter input file for this process */
+	FILE *outf;		/* Filter output file for this process */
+	char *outbuffer;        /* Output line buffer */
+	int outbuffer_len;      /* Output line buffer length */
+	int outbuffer_fill;     /* Output line buffer fill position */
 	const char *auxstr;	/* Auxiliary info from syscall (see RVAL_STR) */
 	const struct_sysent *s_ent; /* sysent[scno] or dummy struct for bad scno */
 	struct timeval stime;	/* System time usage as of last process wait */
@@ -549,6 +553,7 @@ extern const char **paths_selected;
 extern bool need_fork_exec_workarounds;
 extern unsigned xflag;
 extern unsigned followfork;
+extern bool buffer_to_completion;
 extern unsigned ptrace_setoptions;
 extern unsigned max_strlen;
 extern unsigned os_release;
@@ -576,8 +581,10 @@ void die_out_of_memory(void) __attribute__ ((noreturn));
  * Thus disabled by default.
  */
 int strace_vfprintf(FILE *fp, const char *fmt, va_list args);
+int strace_vsnprintf(char *dest, size_t size, const char *fmt, va_list args);
 #else
 # define strace_vfprintf vfprintf
+# define strace_vsnprintf vsnprintf
 #endif
 
 extern void set_sortby(const char *);

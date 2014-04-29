@@ -72,6 +72,8 @@ extern char *optarg;
 
 cflag_t cflag = CFLAG_NONE;
 unsigned int followfork = 0;
+const char *limit_command = NULL;
+bool buffer_to_completion = 0;
 unsigned int ptrace_setoptions = 0;
 unsigned int xflag = 0;
 bool need_fork_exec_workarounds = 0;
@@ -146,6 +148,7 @@ static char *acolumn_spaces;
 
 static char *outfname = NULL;
 /* If -ff, points to stderr. Else, it's our common output log */
+static FILE *shared_input;
 static FILE *shared_log;
 
 struct tcb *printing_tcp = NULL;
@@ -194,17 +197,20 @@ static void
 usage(FILE *ofp, int exitval)
 {
 	fprintf(ofp, "\
-usage: strace [-CdffhiqrtttTvVxxy] [-I n] [-e expr]...\n\
-              [-a column] [-o file] [-s strsize] [-P path]...\n\
+usage: strace [-CdffhiLqrtttTvVxxy] [-I n] [-e expr]...\n\
+              [-a column] [-l command] [-o file] [-s strsize] [-P path]...\n\
               -p pid... / [-D] [-E var=val]... [-u username] PROG [ARGS]\n\
-   or: strace -c[df] [-I n] [-e expr]... [-O overhead] [-S sortby]\n\
+   or: strace -c[df] [-I n] [-l command] [-e expr]... [-O overhead] [-S sortby]\n\
               -p pid... / [-D] [-E var=val]... [-u username] PROG [ARGS]\n\
+   or: strace -Lfyl './filter.pl <rules-for-prog.sf>' prog\n\
 -c -- count time, calls, and errors for each syscall and report summary\n\
 -C -- like -c but also print regular output\n\
 -d -- enable debug output to stderr\n\
 -D -- run tracer process as a detached grandchild, not as parent\n\
 -f -- follow forks, -ff -- with output into separate files\n\
 -i -- print instruction pointer at time of syscall\n\
+-l -- invoke a command to control and possibly limit syscall execution\n\
+-L -- buffer output until syscall returns\n\
 -q -- suppress messages about attaching, detaching, etc.\n\
 -r -- print relative timestamp, -t -- absolute timestamp, -tt -- with usecs\n\
 -T -- print time spent in each syscall\n\
@@ -472,6 +478,7 @@ strace_fopen(const char *path)
 }
 
 static int popen_pid = 0;
+static int control_pid = 0;
 
 #ifndef _PATH_BSHELL
 # define _PATH_BSHELL "/bin/sh"
@@ -526,12 +533,23 @@ tprintf(const char *fmt, ...)
 
 	va_start(args, fmt);
 	if (current_tcp) {
-		int n = strace_vfprintf(current_tcp->outf, fmt, args);
+		int n;
+		if(buffer_to_completion) {
+			n = strace_vsnprintf(current_tcp->outbuffer + current_tcp->outbuffer_fill,
+					current_tcp->outbuffer_len - current_tcp->outbuffer_fill,
+					fmt, args);
+			if(n >= 0) {
+				current_tcp->outbuffer_fill += n;
+			}
+		} else {
+			n = strace_vfprintf(current_tcp->outf, fmt, args);
+		}
+
 		if (n < 0) {
-			if (current_tcp->outf != stderr)
-				perror_msg("%s", outfname);
-		} else
+			if (current_tcp->outf != stderr) perror_msg("%s", outfname);
+		} else {
 			current_tcp->curcol += n;
+		}
 	}
 	va_end(args);
 }
@@ -540,7 +558,20 @@ void
 tprints(const char *str)
 {
 	if (current_tcp) {
-		int n = fputs_unlocked(str, current_tcp->outf);
+		int n;
+		if(buffer_to_completion) {
+			n = strlen(str);
+			strncpy(current_tcp->outbuffer + current_tcp->outbuffer_fill, str,
+					current_tcp->outbuffer_len - current_tcp->outbuffer_fill);
+			if(n < current_tcp->outbuffer_len - current_tcp->outbuffer_fill) {
+				current_tcp->outbuffer_fill += n;
+			} else {
+				current_tcp->outbuffer_fill = current_tcp->outbuffer_len;
+			}
+		} else {
+			n = fputs_unlocked(str, current_tcp->outf);
+		}
+
 		if (n >= 0) {
 			current_tcp->curcol += strlen(str);
 			return;
@@ -555,8 +586,29 @@ line_ended(void)
 {
 	if (current_tcp) {
 		current_tcp->curcol = 0;
-		fflush(current_tcp->outf);
+		if(buffer_to_completion) {
+			if(current_tcp->outbuffer_fill >= current_tcp->outbuffer_len) {
+				--current_tcp->outbuffer_fill;
+			}
+
+			current_tcp->outbuffer[current_tcp->outbuffer_fill] = '\0';
+			fputs_unlocked(current_tcp->outbuffer, current_tcp->outf);
+			current_tcp->outbuffer_fill = 0;
+		}
+
+		if(current_tcp->inf) {
+			fputs_unlocked("CONTINUE?\n", current_tcp->outf);
+			fflush(current_tcp->outf);
+
+			switch(fgetc(current_tcp->inf)) {
+				case '\n': break;
+				default: kill(current_tcp->pid, 9);
+			}
+		} else {
+			fflush(current_tcp->outf);
+		}
 	}
+
 	if (printing_tcp) {
 		printing_tcp->curcol = 0;
 		printing_tcp = NULL;
@@ -581,8 +633,10 @@ printleader(struct tcb *tcp)
 			 * case 2: split log, we are the same tcb, but our last line
 			 * didn't finish ("SIGKILL nuked us after syscall entry" etc).
 			 */
-			tprints(" <unfinished ...>\n");
-			printing_tcp->curcol = 0;
+			if(!buffer_to_completion) {
+				tprints(" <unfinished ...>\n");
+				printing_tcp->curcol = 0;
+			}
 		}
 	}
 
@@ -592,7 +646,7 @@ printleader(struct tcb *tcp)
 
 	if (print_pid_pfx)
 		tprintf("%-5d ", tcp->pid);
-	else if (nprocs > 1 && !outfname)
+	else if (limit_command || (nprocs > 1 && !outfname))
 		tprintf("[pid %5u] ", tcp->pid);
 
 	if (tflag) {
@@ -640,11 +694,21 @@ tabto(void)
 static void
 newoutf(struct tcb *tcp)
 {
+	tcp->inf = shared_input; /* if not -ff mode, then filtering is not possible */
 	tcp->outf = shared_log; /* if not -ff mode, the same file is for all */
+	if(buffer_to_completion) {
+		tcp->outbuffer_len = 1024;
+		tcp->outbuffer_fill = 0;
+		tcp->outbuffer = malloc(tcp->outbuffer_len);
+		if (!tcp->outbuffer) {
+			die_out_of_memory();
+		}
+	}
 	if (followfork >= 2) {
 		char name[520 + sizeof(int) * 3];
 		sprintf(name, "%.512s.%u", outfname, tcp->pid);
 		tcp->outf = strace_fopen(name);
+		tcp->inf = NULL;
 	}
 }
 
@@ -1000,7 +1064,8 @@ startup_attach(void)
  * NOMMU + "daemonized tracer" difficulty.
  */
 struct exec_params {
-	int fd_to_close;
+	int fd_out_to_close;
+	int fd_in_to_close;
 	uid_t run_euid;
 	gid_t run_egid;
 	char **argv;
@@ -1012,8 +1077,10 @@ exec_or_die(void)
 {
 	struct exec_params *params = &params_for_tracee;
 
-	if (params->fd_to_close >= 0)
-		close(params->fd_to_close);
+	if (params->fd_in_to_close >= 0)
+		close(params->fd_in_to_close);
+	if (params->fd_out_to_close >= 0)
+		close(params->fd_out_to_close);
 	if (!daemonized_tracer && !use_seize) {
 		if (ptrace(PTRACE_TRACEME, 0L, 0L, 0L) < 0) {
 			perror_msg_and_die("ptrace(PTRACE_TRACEME, ...)");
@@ -1127,7 +1194,8 @@ startup_child(char **argv)
 		perror_msg_and_die("Can't stat '%s'", filename);
 	}
 
-	params_for_tracee.fd_to_close = (shared_log != stderr) ? fileno(shared_log) : -1;
+	params_for_tracee.fd_in_to_close = (shared_input) ? fileno(shared_input) : -1;
+	params_for_tracee.fd_out_to_close = (shared_log != stderr) ? fileno(shared_log) : -1;
 	params_for_tracee.run_euid = (statbuf.st_mode & S_ISUID) ? statbuf.st_uid : run_uid;
 	params_for_tracee.run_egid = (statbuf.st_mode & S_ISGID) ? statbuf.st_gid : run_gid;
 	params_for_tracee.argv = argv;
@@ -1527,6 +1595,53 @@ get_os_release(void)
 }
 
 /*
+ * Initialization of syscall control pipes.
+ */
+static void init_limit_pipes(const char *command) {
+	int syscall_pipe[2];
+	int control_pipe[2];
+	  
+	if(pipe(syscall_pipe) < 0) {
+		perror_msg_and_die("pipe");
+	}
+	if(pipe(control_pipe) < 0) {
+		perror_msg_and_die("pipe");
+	}
+
+	control_pid = fork();
+	if(control_pid < 0) {
+	  perror_msg_and_die("fork");
+	}
+
+	if (control_pid == 0) {
+		/* child */
+		close(syscall_pipe[1]);
+		close(control_pipe[0]);
+		if (syscall_pipe[0] != 0) {
+			if (dup2(syscall_pipe[0], 0) < 0)
+				perror_msg_and_die("dup2");
+			close(syscall_pipe[0]);
+		}
+		if (control_pipe[1] != 1) {
+			if (dup2(control_pipe[1], 1) < 0)
+				perror_msg_and_die("dup2");
+			close(control_pipe[1]);
+		}
+		execl(_PATH_BSHELL, "sh", "-c", command, NULL);
+		perror_msg_and_die("Can't execute '%s'", _PATH_BSHELL);
+	}
+
+	/* parent */
+	close(syscall_pipe[0]);
+	close(control_pipe[1]);
+	swap_uid();
+	shared_log = fdopen(syscall_pipe[1], "w");
+	if (!shared_log) die_out_of_memory();
+	shared_input = fdopen(control_pipe[0], "r");
+	if (!shared_input) die_out_of_memory();
+}
+
+/*
  * Initialization part of main() was eating much stack (~0.5k),
  * which was unused after init.
  * We can reuse it if we move init code into a separate function.
@@ -1567,6 +1682,7 @@ init(int argc, char *argv[])
 		tcbtab[c] = tcp++;
 
 	shared_log = stderr;
+	shared_input = NULL;
 	set_sortby(DEFAULT_SORTBY);
 	set_personality(DEFAULT_PERSONALITY);
 	qualify("trace=all");
@@ -1577,9 +1693,9 @@ init(int argc, char *argv[])
 #endif
 	qualify("signal=all");
 	while ((c = getopt(argc, argv,
-		"+b:cCdfFhiqrtTvVxyz"
+		"+b:cCdfFhiqrtTvVxyzL"
 		"D"
-		"a:e:o:O:p:s:S:u:E:P:I:")) != EOF) {
+		"a:e:l:o:O:p:s:S:u:E:P:I:")) != EOF) {
 		switch (c) {
 		case 'b':
 			if (strcmp(optarg, "execve") != 0)
@@ -1616,6 +1732,12 @@ init(int argc, char *argv[])
 			break;
 		case 'i':
 			iflag = 1;
+			break;
+		case 'l':
+			limit_command = optarg;
+			break;
+		case 'L':
+			buffer_to_completion = 1;
 			break;
 		case 'q':
 			qflag++;
@@ -1717,6 +1839,9 @@ init(int argc, char *argv[])
 	if (followfork >= 2 && cflag) {
 		error_msg_and_die("(-c or -C) and -ff are mutually exclusive");
 	}
+	if (followfork >= 2 && shared_input) {
+		error_msg_and_die("-l and -ff are mutually exclusive");
+	}
 
 	/* See if they want to run as another user. */
 	if (username != NULL) {
@@ -1746,6 +1871,10 @@ init(int argc, char *argv[])
 		need_fork_exec_workarounds = test_ptrace_setoptions_followfork();
 	need_fork_exec_workarounds |= test_ptrace_setoptions_for_all();
 	test_ptrace_seize();
+
+	if(limit_command) {
+		init_limit_pipes(limit_command);
+	}
 
 	/* Check if they want to redirect the output. */
 	if (outfname) {
@@ -1958,6 +2087,11 @@ trace(void)
 		if (pid == popen_pid) {
 			if (WIFEXITED(status) || WIFSIGNALED(status))
 				popen_pid = 0;
+			continue;
+		}
+		if (pid == control_pid) {
+			if (WIFEXITED(status) || WIFSIGNALED(status))
+				control_pid = 0;
 			continue;
 		}
 
@@ -2291,6 +2425,7 @@ trace(void)
 			 */
 			continue;
 		}
+
  restart_tracee_with_sig_0:
 		sig = 0;
  restart_tracee:
@@ -2317,6 +2452,10 @@ main(int argc, char *argv[])
 		fclose(shared_log);
 	if (popen_pid) {
 		while (waitpid(popen_pid, NULL, 0) < 0 && errno == EINTR)
+			;
+	}
+	if (control_pid) {
+		while (waitpid(control_pid, NULL, 0) < 0 && errno == EINTR)
 			;
 	}
 	if (exit_code > 0xff) {

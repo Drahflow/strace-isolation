@@ -642,7 +642,7 @@ qualifier:
  * If you're not already dealing with a va_list consider using snprintf().
  */
 static
-int kernel_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+int strace_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 {
 	unsigned long long num;
 	char *str, *end;
@@ -766,7 +766,7 @@ int strace_vfprintf(FILE *fp, const char *fmt, va_list args)
 	va_list a1;
 
 	va_copy(a1, args);
-	unsigned len = kernel_vsnprintf(buf, buflen, fmt, a1);
+	unsigned len = strace_vsnprintf(buf, buflen, fmt, a1);
 	va_end(a1);
 
 	if (len >= buflen) {
@@ -775,7 +775,7 @@ int strace_vfprintf(FILE *fp, const char *fmt, va_list args)
 		buf = malloc(buflen);
 		if (!buf)
 			die_out_of_memory();
-		/*len =*/ kernel_vsnprintf(buf, buflen, fmt, args);
+		/*len =*/ strace_vsnprintf(buf, buflen, fmt, args);
 	}
 
 	r = fputs_unlocked(buf, fp);

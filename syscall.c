@@ -2534,11 +2534,13 @@ trace_syscall_exiting(struct tcb *tcp)
 	 */
 	if ((followfork < 2 && printing_tcp != tcp) || (tcp->flags & TCB_REPRINT)) {
 		tcp->flags &= ~TCB_REPRINT;
-		printleader(tcp);
-		if (tcp->qual_flg & UNDEFINED_SCNO)
-			tprintf("<... %s resumed> ", undefined_scno_name(tcp));
-		else
-			tprintf("<... %s resumed> ", tcp->s_ent->sys_name);
+		if(!buffer_to_completion) {
+			printleader(tcp);
+			if (tcp->qual_flg & UNDEFINED_SCNO)
+				tprintf("<... %s resumed> ", undefined_scno_name(tcp));
+			else
+				tprintf("<... %s resumed> ", tcp->s_ent->sys_name);
+		}
 	}
 	printing_tcp = tcp;
 
