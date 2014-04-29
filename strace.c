@@ -540,6 +540,9 @@ tprintf(const char *fmt, ...)
 					fmt, args);
 			if(n >= 0) {
 				current_tcp->outbuffer_fill += n;
+                                if(current_tcp->outbuffer_fill > current_tcp->outbuffer_len) {
+                                	current_tcp->outbuffer_fill = current_tcp->outbuffer_len;
+                                }
 			}
 		} else {
 			n = strace_vfprintf(current_tcp->outf, fmt, args);
